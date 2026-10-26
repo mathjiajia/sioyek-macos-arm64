@@ -304,13 +304,5 @@ jobs:
             cat "$RUNNER_TEMP/publish-error" >&2
             exit 1
           fi
-          # Remove the old separately published files after the new DMG is available.
-          gh api "repos/$GH_REPO/releases/tags/$tag" --jq '.assets[].name' \
-            > "$RUNNER_TEMP/published-assets"
-          for name in sioyek-macos-arm64.zip sioyek-source.tar.gz build-info.json SHA256SUMS submodules.txt; do
-            if grep -Fxq "$name" "$RUNNER_TEMP/published-assets"; then
-              gh release delete-asset "$tag" "$name" --yes
-            fi
-          done
           printf 'Download: https://github.com/%s/releases/tag/%s\n' \
             "$GH_REPO" "$tag" >> "$GITHUB_STEP_SUMMARY"
