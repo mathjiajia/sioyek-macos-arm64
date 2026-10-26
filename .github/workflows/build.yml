@@ -173,7 +173,9 @@ jobs:
           data['SioyekUpstreamCommit'] = os.environ['UPSTREAM_SHA']
           plist.write_bytes(plistlib.dumps(data))
           PY
-          macdeployqt "$app" -qmldir="$GITHUB_WORKSPACE/source/pdf_viewer/touchui" -always-overwrite
+          # Sioyek uses bundled SQLite; omit Qt's ODBC/PostgreSQL plugins.
+          macdeployqt "$app" -qmldir="$GITHUB_WORKSPACE/source/pdf_viewer/touchui" \
+            -always-overwrite -appstore-compliant
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
 
