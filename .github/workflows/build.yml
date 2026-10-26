@@ -1,0 +1,278 @@
+name: Sioyek development for Apple Silicon
+
+on:
+  schedule:
+    - cron: '3-58/5 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if this upstream commit already has a release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sioyek-development-macos-arm64
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: ahrm/sioyek
+  UPSTREAM_BRANCH: development
+
+jobs:
+  check:
+    name: Check for an upstream change
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.upstream.outputs.sha }}
+      build: ${{ steps.upstream.outputs.build }}
+    steps:
+      - name: Resolve upstream and check the published assets
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FORCE_BUILD: ${{ inputs.force || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(gh api "repos/$UPSTREAM_REPOSITORY/commits/$UPSTREAM_BRANCH" --jq '.sha')
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          build=true
+          if complete=$(gh api "repos/$GH_REPO/releases/tags/dev-$sha" \
+            --jq '.draft == false and ([.assets[].name] | contains(["sioyek-macos-arm64.zip", "sioyek-macos-arm64.dmg", "sioyek-source.tar.gz", "build-info.json", "SHA256SUMS"]))' \
+            2> "$RUNNER_TEMP/release-error"); then
+            if [[ "$complete" == true && "$FORCE_BUILD" != true ]]; then
+              build=false
+            fi
+          elif ! grep -q 'HTTP 404' "$RUNNER_TEMP/release-error"; then
+            cat "$RUNNER_TEMP/release-error" >&2
+            exit 1
+          fi
+          printf 'sha=%s\nbuild=%s\n' "$sha" "$build" >> "$GITHUB_OUTPUT"
+          printf 'Upstream: [%s](https://github.com/%s/commit/%s)\n\nBuild required: `%s`\n' \
+            "$sha" "$UPSTREAM_REPOSITORY" "$sha" "$build" >> "$GITHUB_STEP_SUMMARY"
+
+      # GitHub disables public scheduled workflows after 60 days without activity.
+      # Commit a small heartbeat only if there have been no pushes for 30 days.
+      - name: Keep scheduled polling active
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pushed_at=$(gh api "repos/$GH_REPO" --jq '.pushed_at')
+          if (( $(date +%s) - $(date -d "$pushed_at" +%s) < 2592000 )); then
+            exit 0
+          fi
+          previous_sha=''
+          if previous_sha=$(gh api "repos/$GH_REPO/contents/.github/heartbeat" \
+            --jq '.sha' 2> "$RUNNER_TEMP/heartbeat-error"); then
+            :
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/heartbeat-error"; then
+            previous_sha=''
+          else
+            cat "$RUNNER_TEMP/heartbeat-error" >&2
+            exit 1
+          fi
+          content=$(date -u '+%Y-%m-%dT%H:%M:%SZ' | base64 -w0)
+          jq -n --arg content "$content" --arg sha "$previous_sha" \
+            '{message: "Keep upstream polling active", content: $content} +
+             (if $sha == "" then {} else {sha: $sha} end)' > "$RUNNER_TEMP/heartbeat.json"
+          gh api --method PUT "repos/$GH_REPO/contents/.github/heartbeat" \
+            --input "$RUNNER_TEMP/heartbeat.json" > /dev/null
+
+  build:
+    name: Build and publish macOS arm64
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      UPSTREAM_SHA: ${{ needs.check.outputs.sha }}
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Verify the Apple Silicon runner
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == arm64 ]]
+          sw_vers
+          xcodebuild -version
+
+      - name: Check out the exact upstream commit and all submodules
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: ahrm/sioyek
+          ref: ${{ env.UPSTREAM_SHA }}
+          submodules: recursive
+          persist-credentials: false
+          path: source
+
+      - name: Archive the corresponding source before compiling
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          git -C source submodule status --recursive > dist/submodules.txt
+          tar --exclude='.git' -czf dist/sioyek-source.tar.gz source
+
+      - name: Install Qt 6.8.3
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4
+        with:
+          version: '6.8.3'
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: 'qtspeech qtmultimedia qtshadertools qt5compat'
+          cache: true
+
+      - name: Compile MuPDF and Sioyek
+        working-directory: source
+        run: |
+          set -euo pipefail
+          parallel_jobs=$(sysctl -n hw.logicalcpu)
+          make -C mupdf HAVE_GLUT=no build=release -j"$parallel_jobs"
+          qmake pdf_viewer_build_config.pro 'CONFIG+=release' \
+            'QMAKE_APPLE_DEVICE_ARCHS=arm64' \
+            "QMAKE_MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET"
+          make -j"$parallel_jobs"
+
+      - name: Bundle resources and Qt, then sign the app
+        run: |
+          set -euo pipefail
+          app="$GITHUB_WORKSPACE/source/sioyek.app"
+          resources="$app/Contents/Resources"
+          mkdir -p "$resources/licenses"
+          cp -R source/pdf_viewer/shaders "$resources/"
+          cp source/pdf_viewer/prefs.config source/pdf_viewer/keys.config "$resources/"
+          cp source/pdf_viewer/prefs_user.config source/pdf_viewer/keys_user.config "$resources/"
+          cp source/tutorial.pdf "$resources/"
+          cp source/LICENSE "$resources/licenses/Sioyek-LICENSE"
+          cp source/mupdf/COPYING "$resources/licenses/MuPDF-COPYING"
+          python3 - <<'PY'
+          import os, pathlib, plistlib
+          plist = pathlib.Path('source/sioyek.app/Contents/Info.plist')
+          data = plistlib.loads(plist.read_bytes())
+          data['LSMinimumSystemVersion'] = os.environ['MACOSX_DEPLOYMENT_TARGET']
+          data['CFBundleVersion'] = os.environ['GITHUB_RUN_NUMBER']
+          data['SioyekUpstreamCommit'] = os.environ['UPSTREAM_SHA']
+          plist.write_bytes(plistlib.dumps(data))
+          PY
+          macdeployqt "$app" -qmldir="$GITHUB_WORKSPACE/source/pdf_viewer/touchui" -always-overwrite
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - name: Verify architecture, bundled dependencies and startup
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, subprocess
+          app = pathlib.Path('source/sioyek.app').resolve()
+          executable = app / 'Contents/MacOS/sioyek'
+          archs = subprocess.check_output(['lipo', '-archs', str(executable)], text=True).strip()
+          if archs != 'arm64':
+              raise SystemExit(f'Expected an arm64 executable; found {archs}')
+          for path in app.rglob('*'):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              with path.open('rb') as stream:
+                  magic = stream.read(4)
+              if magic not in (b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'):
+                  continue
+              archs = subprocess.check_output(['lipo', '-archs', str(path)], text=True).split()
+              if 'arm64' not in archs:
+                  raise SystemExit(f'Missing arm64 slice: {path}')
+              linked = subprocess.check_output(['otool', '-L', str(path)], text=True)
+              for line in linked.splitlines()[1:]:
+                  dependency = line.strip().split(' (', 1)[0]
+                  if dependency.startswith('/') and not dependency.startswith(('/usr/lib/', '/System/Library/')):
+                      raise SystemExit(f'Unbundled dependency in {path}: {dependency}')
+          for relative in ['prefs.config', 'keys.config', 'tutorial.pdf', 'shaders/simple.vertex', 'shaders/simple.fragment']:
+              if not (app / 'Contents/Resources' / relative).is_file():
+                  raise SystemExit(f'Missing app resource: {relative}')
+          clean_env = {key: value for key, value in os.environ.items()
+                       if not key.startswith(('QT_', 'QML', 'DYLD_'))}
+          result = subprocess.run([str(executable), '--help'], env=clean_env,
+                                  text=True, capture_output=True, timeout=30)
+          print(result.stdout)
+          print(result.stderr)
+          result.check_returncode()
+          print('Verified arm64, bundled libraries, resources, and --help startup.')
+          PY
+
+      - name: Package the signed app and record build provenance
+        run: |
+          set -euo pipefail
+          ditto -c -k --sequesterRsrc --keepParent source/sioyek.app dist/sioyek-macos-arm64.zip
+          mkdir -p "$RUNNER_TEMP/sioyek-dmg"
+          ditto source/sioyek.app "$RUNNER_TEMP/sioyek-dmg/sioyek.app"
+          ln -s /Applications "$RUNNER_TEMP/sioyek-dmg/Applications"
+          hdiutil create -volname 'Sioyek Development arm64' \
+            -srcfolder "$RUNNER_TEMP/sioyek-dmg" -ov -format UDZO dist/sioyek-macos-arm64.dmg
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, subprocess
+          info = {
+              'upstream_repository': os.environ['UPSTREAM_REPOSITORY'],
+              'upstream_branch': os.environ['UPSTREAM_BRANCH'],
+              'upstream_commit': os.environ['UPSTREAM_SHA'],
+              'automation_commit': os.environ['GITHUB_SHA'],
+              'architecture': 'arm64',
+              'minimum_macos': os.environ['MACOSX_DEPLOYMENT_TARGET'],
+              'qt_version': subprocess.check_output(['qmake', '-query', 'QT_VERSION'], text=True).strip(),
+              'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'submodules': pathlib.Path('dist/submodules.txt').read_text().splitlines(),
+              'signing': 'ad-hoc; not notarised',
+          }
+          pathlib.Path('dist/build-info.json').write_text(json.dumps(info, indent=2) + '\n')
+          PY
+          (cd dist && shasum -a 256 sioyek-macos-arm64.zip sioyek-macos-arm64.dmg \
+            sioyek-source.tar.gz build-info.json submodules.txt > SHA256SUMS)
+
+      - name: Publish the development release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="dev-$UPSTREAM_SHA"
+          title="Development ${UPSTREAM_SHA:0:12} - macOS arm64"
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          Apple Silicon build of [$UPSTREAM_REPOSITORY, $UPSTREAM_BRANCH](https://github.com/$UPSTREAM_REPOSITORY/commit/$UPSTREAM_SHA).
+
+          Requires macOS $MACOSX_DEPLOYMENT_TARGET or newer. Download the DMG or ZIP; Qt is bundled.
+          The app is ad-hoc signed and is not notarised with an Apple Developer certificate.
+
+          The complete Sioyek source tree, including recursive submodules, is attached as sioyek-source.tar.gz.
+          Build details and checksums are attached as build-info.json and SHA256SUMS.
+
+          [Build log](https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID)
+          EOF
+          if gh api "repos/$GH_REPO/releases/tags/$tag" > /dev/null 2> "$RUNNER_TEMP/publish-error"; then
+            gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --title "$title" --notes-file "$notes" --prerelease
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/publish-error"; then
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" \
+              --title "$title" --notes-file "$notes" --prerelease
+          else
+            cat "$RUNNER_TEMP/publish-error" >&2
+            exit 1
+          fi
+          printf 'Download: https://github.com/%s/releases/tag/%s\n' \
+            "$GH_REPO" "$tag" >> "$GITHUB_STEP_SUMMARY"
