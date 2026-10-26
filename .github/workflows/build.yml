@@ -176,6 +176,14 @@ jobs:
           # Sioyek uses bundled SQLite; omit Qt's ODBC/PostgreSQL plugins.
           macdeployqt "$app" -qmldir="$GITHUB_WORKSPACE/source/pdf_viewer/touchui" \
             -always-overwrite -appstore-compliant
+          # Keep SQLite for QML local storage; other SQL drivers require external clients.
+          python3 - <<'PY'
+          from pathlib import Path
+          for plugin in Path('source/sioyek.app/Contents/PlugIns/sqldrivers').glob('*.dylib'):
+              if plugin.name != 'libqsqlite.dylib':
+                  print(f'Removing unused database driver: {plugin.name}')
+                  plugin.unlink()
+          PY
           codesign --force --deep --sign - "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
 
@@ -189,6 +197,7 @@ jobs:
           archs = subprocess.check_output(['lipo', '-archs', str(executable)], text=True).strip()
           if archs != 'arm64':
               raise SystemExit(f'Expected an arm64 executable; found {archs}')
+          errors = []
           for path in app.rglob('*'):
               if not path.is_file() or path.is_symlink():
                   continue
@@ -198,7 +207,8 @@ jobs:
                   continue
               archs = subprocess.check_output(['lipo', '-archs', str(path)], text=True).split()
               if 'arm64' not in archs:
-                  raise SystemExit(f'Missing arm64 slice: {path}')
+                  errors.append(f'Missing arm64 slice: {path}')
+                  continue
               # otool -L also prints a dylib's own LC_ID_DYLIB. That install
               # name is not a dependency; inspect one architecture and omit it.
               install_ids = subprocess.check_output(
@@ -210,10 +220,12 @@ jobs:
                   if dependency in install_ids:
                       continue
                   if dependency.startswith('/') and not dependency.startswith(('/usr/lib/', '/System/Library/')):
-                      raise SystemExit(f'Unbundled dependency in {path}: {dependency}')
+                      errors.append(f'Unbundled dependency in {path}: {dependency}')
           for relative in ['prefs.config', 'keys.config', 'tutorial.pdf', 'shaders/simple.vertex', 'shaders/simple.fragment']:
               if not (app / 'Contents/Resources' / relative).is_file():
-                  raise SystemExit(f'Missing app resource: {relative}')
+                  errors.append(f'Missing app resource: {relative}')
+          if errors:
+              raise SystemExit('\n'.join(errors))
           clean_env = {key: value for key, value in os.environ.items()
                        if not key.startswith(('QT_', 'QML', 'DYLD_'))}
           result = subprocess.run([str(executable), '--help'], env=clean_env,
