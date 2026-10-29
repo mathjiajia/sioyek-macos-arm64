@@ -41,7 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          FORCE_BUILD: ${{ inputs.force || false }}
+          FORCE_BUILD: ${{ inputs.force || github.event_name == 'push' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -123,17 +123,6 @@ jobs:
           submodules: recursive
           persist-credentials: false
           path: source
-
-      - name: Archive the corresponding source before compiling
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          tar --exclude='.git' -czf dist/sioyek-source.tar.gz source
-          gh api -H 'Accept: application/vnd.github.raw+json' \
-            "repos/$GH_REPO/contents/.github/workflows/build.yml?ref=$GITHUB_SHA" > dist/build.yml
 
       - name: Install Qt 6.8.3
         uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4
@@ -240,32 +229,12 @@ jobs:
           print('Verified arm64, bundled libraries, resources, and --help startup.')
           PY
 
-      - name: Package the DMG with source and build details
+      - name: Package the DMG with only the Sioyek app
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import datetime, json, os, pathlib, subprocess
-          info = {
-              'upstream_repository': os.environ['UPSTREAM_REPOSITORY'],
-              'upstream_branch': os.environ['UPSTREAM_BRANCH'],
-              'upstream_commit': os.environ['UPSTREAM_SHA'],
-              'automation_commit': os.environ['GITHUB_SHA'],
-              'architecture': 'arm64',
-              'minimum_macos': os.environ['MACOSX_DEPLOYMENT_TARGET'],
-              'qt_version': subprocess.check_output(['qmake', '-query', 'QT_VERSION'], text=True).strip(),
-              'built_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-              'run_url': f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
-              'submodules': subprocess.check_output(
-                  ['git', '-C', 'source', 'submodule', 'status', '--recursive'], text=True).splitlines(),
-              'signing': 'ad-hoc; not notarised',
-          }
-          pathlib.Path('dist/build-info.json').write_text(json.dumps(info, indent=2) + '\n')
-          PY
-          dmg_root="$RUNNER_TEMP/sioyek-dmg"
-          mkdir -p "$dmg_root/Source"
+          mkdir -p dist
+          dmg_root=$(mktemp -d "$RUNNER_TEMP/sioyek-dmg.XXXXXX")
           ditto source/sioyek.app "$dmg_root/sioyek.app"
-          ln -s /Applications "$dmg_root/Applications"
-          cp dist/sioyek-source.tar.gz dist/build-info.json dist/build.yml "$dmg_root/Source/"
           hdiutil create -volname 'Sioyek Development arm64' \
             -srcfolder "$dmg_root" -ov -format UDZO dist/sioyek-macos-arm64.dmg
           hdiutil verify dist/sioyek-macos-arm64.dmg
@@ -287,8 +256,7 @@ jobs:
           Download sioyek-macos-arm64.dmg, open it, and drag Sioyek to Applications. Qt is bundled.
           The app is ad-hoc signed and is not notarised with an Apple Developer certificate.
 
-          The DMG's Source folder contains the complete Sioyek source tree, recursive submodules,
-          this build workflow, and build details.
+          The DMG contains only sioyek.app.
 
           DMG SHA-256: $dmg_sha256
 
